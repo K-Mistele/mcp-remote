@@ -1,10 +1,11 @@
 import { OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { OAuthCallbackServerOptions } from './types'
+import crypto from 'crypto'
 import express from 'express'
 import net from 'net'
-import crypto from 'crypto'
+import { OAuthCallbackServerOptions } from './types'
 
 // Package version from package.json
 export const MCP_REMOTE_VERSION = require('../../package.json').version
@@ -15,130 +16,351 @@ export function log(str: string, ...rest: unknown[]) {
   console.error(`[${pid}] ${str}`, ...rest)
 }
 
-/**
- * Creates a bidirectional proxy between two transports
- * @param params The transport connections to proxy between
- */
-export function mcpProxy({ transportToClient, transportToServer }: { transportToClient: Transport; transportToServer: Transport }) {
-  let transportToClientClosed = false
-  let transportToServerClosed = false
+// --- Helper function for Handling Unauthorized Errors during send() for HTTP ---
+// This function performs the auth flow and returns a NEW, started transport.
+// It no longer needs SSE specific logic.
+async function handleUnauthorizedHttpSendError(
+  failedTransport: StreamableHTTPClientTransport, // Specifically HTTP transport
+  authProvider: OAuthClientProvider,
+  headers: Record<string, string>,
+  waitForAuthCode: () => Promise<string>,
+  serverUrl: string,
+  // No sseEventSourceInit needed
+): Promise<StreamableHTTPClientTransport> {
+  // Returns the specific type
+  log('Unauthorized error during HTTP send() detected, starting authentication flow...')
 
-  transportToClient.onmessage = (message) => {
-    // @ts-expect-error TODO
-    log('[Local→Remote]', message.method || message.id)
-    transportToServer.send(message).catch(onServerError)
-  }
+  // Wait for the authorization code
+  log('HTTP Send Auth: Waiting for auth code...')
+  const code = await waitForAuthCode()
+  log('HTTP Send Auth: Got code, calling finishAuth...')
 
-  transportToServer.onmessage = (message) => {
-    // @ts-expect-error TODO: fix this type
-    log('[Remote→Local]', message.method || message.id)
-    transportToClient.send(message).catch(onClientError)
-  }
+  try {
+    // Finish auth on the *original* transport instance
+    await failedTransport.finishAuth(code)
+    log('HTTP Send Auth: finishAuth successful.')
 
-  transportToClient.onclose = () => {
-    if (transportToServerClosed) {
-      return
-    }
+    // Create a NEW transport instance
+    log('HTTP Send Auth: Creating new transport...')
+    const url = new URL(serverUrl)
+    const originalSessionId = failedTransport.sessionId // Get Session ID
+    log(`HTTP Send Auth: Recreating StreamableHTTP transport, original session ID: ${originalSessionId}`)
 
-    transportToClientClosed = true
-    transportToServer.close().catch(onServerError)
-  }
+    const newTransport = new StreamableHTTPClientTransport(url, {
+      authProvider,
+      requestInit: { headers },
+      sessionId: originalSessionId, // Preserve Session ID
+    })
 
-  transportToServer.onclose = () => {
-    if (transportToClientClosed) {
-      return
-    }
-    transportToServerClosed = true
-    transportToClient.close().catch(onClientError)
-  }
+    // Setup basic handlers for the new transport
+    newTransport.onerror = (error) => log('[New HTTP Transport - Send Auth] Error:', error)
+    newTransport.onclose = () => log('[New HTTP Transport - Send Auth] Closed')
 
-  transportToClient.onerror = onClientError
-  transportToServer.onerror = onServerError
+    log('HTTP Send Auth: Starting new transport...')
+    await newTransport.start() // Start the new transport
+    log('HTTP Send Auth: New transport started.')
 
-  function onClientError(error: Error) {
-    log('Error from local client:', error)
-  }
-
-  function onServerError(error: Error) {
-    log('Error from remote server:', error)
+    log('HTTP Send Auth: Re-authentication successful. Returning new transport.')
+    return newTransport // Return the new, started transport
+  } catch (authError) {
+    log('HTTP Send Auth: Error during re-authentication flow:', authError)
+    throw authError // Re-throw if re-auth fails
   }
 }
 
 /**
- * Creates and connects to a remote SSE server with OAuth authentication
- * @param serverUrl The URL of the remote server
- * @param authProvider The OAuth client provider
- * @param headers Additional headers to send with the request
- * @param waitForAuthCode Function to wait for the auth code
- * @param skipBrowserAuth Whether to skip browser auth and use shared auth
- * @returns The connected SSE client transport
+ * Creates a bidirectional proxy between two transports, handling re-authentication on send FOR HTTP ONLY.
+ * @param params The transport connections and auth dependencies
+ */
+export function mcpProxy({
+  transportToClient,
+  transportToServer: initialTransportToServer,
+  // Dependencies needed for re-authentication during send()
+  authProvider,
+  headers,
+  transportType, // Still need type to gate the logic
+  waitForAuthCode,
+  serverUrl,
+  // sseEventSourceInit, // REMOVED from parameters
+}: {
+  transportToClient: Transport
+  transportToServer: Transport
+  authProvider: OAuthClientProvider
+  headers: Record<string, string>
+  transportType: TransportType
+  waitForAuthCode: () => Promise<string>
+  serverUrl: string
+  // sseEventSourceInit?: object // REMOVED
+}) {
+  let transportToClientClosed = false
+  let transportToServerClosed = false
+  let transportToServer = initialTransportToServer // Mutable transport reference
+
+  // --- Error Handlers (Simplified) ---
+  function onClientError(error: Error) {
+    log('Error from local client:', error)
+    if (!transportToServerClosed) transportToServer.close().catch(onServerError)
+  }
+  function onServerError(error: Error) {
+    log('Error from remote server:', error)
+    if (!transportToClientClosed) transportToClient.close().catch(onClientError)
+  }
+
+  // --- Function to Register/Re-register Handlers on the Server Transport ---
+  function registerServerTransportHandlers(serverTransport: Transport) {
+    serverTransport.onmessage = undefined
+    serverTransport.onclose = undefined
+    serverTransport.onerror = undefined
+
+    serverTransport.onmessage = (message) => {
+      const id = 'id' in message ? message.id : undefined
+      const method = 'method' in message ? message.method : undefined
+      log('[Remote→Local]', method || id)
+      if (!transportToClientClosed) transportToClient.send(message).catch(onClientError)
+    }
+    serverTransport.onclose = () => {
+      if (transportToClientClosed) return
+      log('Remote server transport closed')
+      transportToServerClosed = true
+      if (!transportToClientClosed) transportToClient.close().catch(onClientError)
+    }
+    serverTransport.onerror = onServerError
+  }
+
+  // Register handlers for the *initial* server transport
+  registerServerTransportHandlers(transportToServer)
+
+  // --- Message From Client to Server (Handles Auth on Send for HTTP ONLY) ---
+  transportToClient.onmessage = async (message) => {
+    const id = 'id' in message ? message.id : undefined
+    const method = 'method' in message ? message.method : undefined
+    log('[Local→Remote]', method || id)
+
+    if (transportToServerClosed) {
+      log('Cannot send message, server transport closed.')
+      return
+    }
+
+    try {
+      await transportToServer.send(message)
+      log(`Message ${method || id} sent successfully.`)
+    } catch (error) {
+      // --- Auth Handling during Send (HTTP ONLY) ---
+      // Check for Auth Error *AND* if transport is HTTP
+      if (
+        (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) &&
+        transportType === 'streamable-http'
+      ) {
+        log('UnauthorizedError caught during HTTP send(). Attempting re-authentication...')
+        try {
+          // Call the HTTP-specific helper
+          const newTransport = await handleUnauthorizedHttpSendError(
+            transportToServer as StreamableHTTPClientTransport, // Cast to specific type
+            authProvider,
+            headers,
+            waitForAuthCode,
+            serverUrl,
+            // No sseEventSourceInit needed
+          )
+
+          log('Updating active server transport reference.')
+          transportToServer = newTransport
+
+          log('Re-registering handlers on new server transport.')
+          registerServerTransportHandlers(transportToServer)
+
+          log('Re-authentication successful, retrying original message send...')
+          await transportToServer.send(message)
+          log(`Original message ${method || id} successfully sent after re-authentication.`)
+        } catch (reauthError) {
+          log('Failed to re-authenticate or retry sending HTTP message:', reauthError)
+          if (!transportToClientClosed) transportToClient.close().catch(onClientError)
+          if (!transportToServerClosed)
+            transportToServer.close().catch((e) => log('Error closing server transport after HTTP reauth failure:', e))
+        }
+        // --- End Auth Handling ---
+      } else {
+        // Handle non-authentication errors OR auth errors for SSE (which shouldn't happen here)
+        log(`Error sending message (${transportType}) to remote server:`, error)
+        onServerError(error as Error)
+      }
+    }
+  }
+
+  // --- Client Close Handler & Error Handler ---
+  transportToClient.onclose = () => {
+    if (transportToServerClosed) return
+    log('Local client transport closed')
+    transportToClientClosed = true
+    if (!transportToServerClosed) transportToServer.close().catch(onServerError)
+  }
+  transportToClient.onerror = onClientError
+}
+
+// --- Function to start SSE transport and handle its specific auth flow during start() ---
+async function startSSETransport(
+  transport: SSEClientTransport,
+  authProvider: OAuthClientProvider,
+  headers: Record<string, string>,
+  waitForAuthCode: () => Promise<string>,
+  skipBrowserAuth: boolean,
+  url: URL, // Server URL object
+  sseEventSourceInit: object, // Must be provided for SSE
+): Promise<Transport> {
+  log('Starting SSE transport...')
+  // --- Start of Moved try/catch block ---
+  try {
+    await transport.start()
+    log('SSE Transport started successfully (initial attempt).')
+    return transport // Return original if start succeeded
+  } catch (error) {
+    if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
+      log('UnauthorizedError during SSE start(), handling auth...')
+      if (skipBrowserAuth) {
+        log('SSE Start Auth: Skipping browser auth - using shared auth')
+      } else {
+        log('SSE Start Auth: Waiting for authorization...')
+      }
+
+      const code = await waitForAuthCode()
+      log('SSE Start Auth: Got code, calling finishAuth...')
+
+      try {
+        // Finish auth on the *original* transport instance
+        await transport.finishAuth(code)
+        log('SSE Start Auth: finishAuth successful. Creating new transport...')
+
+        // Create a new transport after auth
+        const newTransport = new SSEClientTransport(url, {
+          authProvider,
+          requestInit: { headers },
+          eventSourceInit: sseEventSourceInit, // Re-use the same init object
+        })
+
+        // Setup handlers on new transport (basic logging)
+        newTransport.onerror = (err) => log('[New SSE Transport - Start Auth] Error:', err)
+        newTransport.onclose = () => log('[New SSE Transport - Start Auth] Closed')
+
+        log('SSE Start Auth: Starting new transport...')
+        await newTransport.start()
+        log('SSE Start Auth: New transport started successfully.')
+
+        // Return the NEW transport
+        return newTransport
+      } catch (authError) {
+        log('SSE Start Auth: Error during auth flow:', authError)
+        throw authError // Re-throw error if auth during start fails
+      }
+    } else {
+      // Handle non-auth errors during start()
+      log('SSE Start: Non-auth error during start():', error)
+      throw error
+    }
+  }
+  // --- End of Moved try/catch block ---
+}
+
+// --- Function to start Streamable HTTP transport (Simplified Start) ---
+async function startStreamableHttpTransport(
+  transport: StreamableHTTPClientTransport,
+  // Remove unused auth parameters for the start phase
+  // authProvider: OAuthClientProvider,
+  // headers: Record<string, string>,
+  // waitForAuthCode: () => Promise<string>,
+  // skipBrowserAuth: boolean,
+  // url: URL
+): Promise<Transport> {
+  log('Starting Streamable HTTP transport (simple start)...')
+  // For Streamable HTTP, start() is simple. Auth errors are handled during send().
+  try {
+    await transport.start()
+    log('Streamable HTTP Transport started successfully.')
+    return transport // Return the original transport
+  } catch (error) {
+    // Catch generic errors during start (e.g., network issues)
+    log('HTTP Start: Non-auth error during start():', error)
+    throw error
+  }
+}
+
+/**
+ * Creates and connects to a remote server with OAuth authentication
+ * Calls appropriate start* function based on transport type.
  */
 export async function connectToRemoteServer(
   serverUrl: string,
   authProvider: OAuthClientProvider,
   headers: Record<string, string>,
+  transportType: TransportType,
   waitForAuthCode: () => Promise<string>,
   skipBrowserAuth: boolean = false,
-): Promise<SSEClientTransport> {
-  log(`[${pid}] Connecting to remote server: ${serverUrl}`)
+): Promise<{ transport: Transport; sseEventSourceInit?: object }> {
+  // Return object
+  log(`[${pid}] Connecting to remote server: ${serverUrl} using ${transportType}`)
   const url = new URL(serverUrl)
 
-  // Create transport with eventSourceInit to pass Authorization header if present
-  const eventSourceInit = {
-    fetch: (url: string | URL, init?: RequestInit) => {
-      return Promise.resolve(authProvider?.tokens?.()).then((tokens) =>
-        fetch(url, {
-          ...init,
-          headers: {
-            ...(init?.headers as Record<string, string> | undefined),
-            ...headers,
-            ...(tokens?.access_token ? { Authorization: `Bearer ${tokens.access_token}` } : {}),
-            Accept: "text/event-stream",
-          } as Record<string, string>,
+  let transport: Transport
+  let sseEventSourceInit: object | undefined = undefined
+
+  // 1. Initialize Transport
+  if (transportType === 'streamable-http') {
+    log(`Initializing StreamableHTTPClientTransport...`)
+    transport = new StreamableHTTPClientTransport(url, {
+      authProvider,
+      requestInit: { headers },
+    })
+    log('StreamableHTTPClientTransport initialized')
+  } else {
+    // Default to SSE
+    log(`Initializing SSEClientTransport...`)
+    sseEventSourceInit = {
+      fetch: (fetchUrl: string | URL, init?: RequestInit) => {
+        return Promise.resolve(authProvider?.tokens?.()).then((tokens) => {
+          return fetch(fetchUrl, {
+            ...init,
+            headers: {
+              ...(init?.headers as Record<string, string> | undefined),
+              ...headers,
+              ...(tokens?.access_token ? { Authorization: `Bearer ${tokens.access_token}` } : {}),
+              Accept: 'text/event-stream',
+            } as Record<string, string>,
+          })
         })
-      );
-    },
-  };
-
-  const transport = new SSEClientTransport(url, {
-    authProvider,
-    requestInit: { headers },
-    eventSourceInit,
-  })
-
-  try {
-    await transport.start()
-    log('Connected to remote server')
-    return transport
-  } catch (error) {
-    if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
-      if (skipBrowserAuth) {
-        log('Authentication required but skipping browser auth - using shared auth')
-      } else {
-        log('Authentication required. Waiting for authorization...')
-      }
-
-      // Wait for the authorization code from the callback
-      const code = await waitForAuthCode()
-
-      try {
-        log('Completing authorization...')
-        await transport.finishAuth(code)
-
-        // Create a new transport after auth
-        const newTransport = new SSEClientTransport(url, { authProvider, requestInit: { headers } })
-        await newTransport.start()
-        log('Connected to remote server after authentication')
-        return newTransport
-      } catch (authError) {
-        log('Authorization error:', authError)
-        throw authError
-      }
-    } else {
-      log('Connection error:', error)
-      throw error
+      },
     }
+    transport = new SSEClientTransport(url, {
+      authProvider,
+      requestInit: { headers },
+      eventSourceInit: sseEventSourceInit,
+    })
+    log('SSEClientTransport initialized')
   }
+
+  // 2. Start Transport using appropriate helper function
+  let finalTransport: Transport
+  if (transportType === 'streamable-http') {
+    finalTransport = await startStreamableHttpTransport(
+      transport as StreamableHTTPClientTransport, // Cast to specific type
+      // Pass only necessary args for simple start
+    )
+  } else {
+    // Must be SSE
+    if (!sseEventSourceInit) {
+      throw new Error('Internal error: sseEventSourceInit is missing for SSE transport start')
+    }
+    finalTransport = await startSSETransport(
+      transport as SSEClientTransport, // Cast to specific type
+      authProvider,
+      headers,
+      waitForAuthCode,
+      skipBrowserAuth,
+      url,
+      sseEventSourceInit,
+    )
+  }
+
+  // 3. Return the final connected transport and sseEventSourceInit (if applicable)
+  return { transport: finalTransport, sseEventSourceInit }
 }
 
 /**
@@ -245,6 +467,11 @@ export function setupOAuthCallbackServer(options: OAuthCallbackServerOptions) {
 }
 
 /**
+ * Defines the available transport types
+ */
+export type TransportType = 'sse' | 'streamable-http'
+
+/**
  * Finds an available port on the local machine
  * @param preferredPort Optional preferred port to try first
  * @returns A promise that resolves to an available port number
@@ -274,14 +501,21 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
   })
 }
 
+interface ParsedArgs {
+  serverUrl: string
+  callbackPort: number
+  headers: Record<string, string>
+  transportType: TransportType
+}
+
 /**
  * Parses command line arguments for MCP clients and proxies
  * @param args Command line arguments
  * @param defaultPort Default port for the callback server if specified port is unavailable
  * @param usage Usage message to show on error
- * @returns A promise that resolves to an object with parsed serverUrl, callbackPort and headers
+ * @returns A promise that resolves to an object with parsed serverUrl, callbackPort, headers, and transportType
  */
-export async function parseCommandLineArgs(args: string[], defaultPort: number, usage: string) {
+export async function parseCommandLineArgs(args: string[], defaultPort: number, usage: string): Promise<ParsedArgs> {
   // Process headers
   const headers: Record<string, string> = {}
   args.forEach((arg, i) => {
@@ -296,6 +530,21 @@ export async function parseCommandLineArgs(args: string[], defaultPort: number, 
       args.splice(i, 2)
     }
   })
+
+  // Process transport type
+  let transportType: TransportType = 'sse' // Default
+  const transportIndex = args.findIndex((arg) => arg === '--transport')
+  if (transportIndex !== -1 && transportIndex < args.length - 1) {
+    const specifiedTransport = args[transportIndex + 1].toLowerCase()
+    if (specifiedTransport === 'sse' || specifiedTransport === 'streamable-http') {
+      transportType = specifiedTransport
+      log(`Using specified transport: ${transportType}`)
+    } else {
+      log(`Warning: Invalid transport type '${specifiedTransport}'. Using default 'sse'.`)
+    }
+    // Remove --transport and its value from args so it doesn't interfere later
+    args.splice(transportIndex, 2)
+  }
 
   const serverUrl = args[0]
   const specifiedPort = args[1] ? parseInt(args[1]) : undefined
@@ -343,7 +592,7 @@ export async function parseCommandLineArgs(args: string[], defaultPort: number, 
     })
   }
 
-  return { serverUrl, callbackPort, headers }
+  return { serverUrl, callbackPort, headers, transportType }
 }
 
 /**

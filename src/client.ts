@@ -9,19 +9,21 @@
  * If callback-port is not specified, an available port will be automatically selected.
  */
 
-import { EventEmitter } from 'events'
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { ListResourcesResultSchema, ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
-import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
-import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
-import { parseCommandLineArgs, setupSignalHandlers, log, MCP_REMOTE_VERSION, getServerUrlHash } from './lib/utils'
+import { EventEmitter } from 'events'
 import { coordinateAuth } from './lib/coordination'
+import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
+import { getServerUrlHash, log, MCP_REMOTE_VERSION, parseCommandLineArgs, setupSignalHandlers, TransportType } from './lib/utils.js'
 
 /**
  * Main function to run the client
  */
-async function runClient(serverUrl: string, callbackPort: number, headers: Record<string, string>) {
+async function runClient(serverUrl: string, callbackPort: number, headers: Record<string, string>, transportType: TransportType) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
@@ -41,8 +43,6 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
   // If auth was completed by another instance, just log that we'll use the auth from disk
   if (skipBrowserAuth) {
     log('Authentication was completed by another instance - will use tokens from disk...')
-    // TODO: remove, the callback is happening before the tokens are exchanged
-    //  so we're slightly too early
     await new Promise((res) => setTimeout(res, 1_000))
   }
 
@@ -59,8 +59,13 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
 
   // Create the transport factory
   const url = new URL(serverUrl)
-  function initTransport() {
-    const transport = new SSEClientTransport(url, { authProvider, requestInit: { headers } })
+  function initTransport(): Transport {
+    let transport: Transport
+    if (transportType === 'streamable-http') {
+      transport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+    } else {
+      transport = new SSEClientTransport(url, { authProvider, requestInit: { headers } })
+    }
 
     // Set up message and error handlers
     transport.onmessage = (message) => {
@@ -78,7 +83,8 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
     return transport
   }
 
-  const transport = initTransport()
+  // Initialize the first transport instance
+  let currentTransport = initTransport()
 
   // Set up cleanup handler
   const cleanup = async () => {
@@ -91,7 +97,7 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
   // Try to connect
   try {
     log('Connecting to server...')
-    await client.connect(transport)
+    await client.connect(currentTransport)
     log('Connected successfully!')
   } catch (error) {
     if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
@@ -102,13 +108,17 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
 
       try {
         log('Completing authorization...')
-        await transport.finishAuth(code)
+        // finishAuth should exist on both SSEClientTransport and StreamableHTTPClientTransport
+        await (currentTransport as SSEClientTransport | StreamableHTTPClientTransport).finishAuth(code)
 
-        // Reconnect after authorization with a new transport
-        log('Connecting after authorization...')
-        await client.connect(initTransport())
+        // Create a new transport instance after auth
+        log('Creating new transport after authorization...')
+        currentTransport = initTransport()
 
-        log('Connected successfully!')
+        log('Re-connecting after authorization...')
+        await client.connect(currentTransport)
+
+        log('Connected successfully post-auth!')
 
         // Request tools list after auth
         log('Requesting tools list...')
@@ -122,7 +132,7 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
 
         log('Listening for messages. Press Ctrl+C to exit.')
       } catch (authError) {
-        log('Authorization error:', authError)
+        log('Client Authorization error:', authError)
         server.close()
         process.exit(1)
       }
@@ -156,8 +166,8 @@ async function runClient(serverUrl: string, callbackPort: number, headers: Recor
 
 // Parse command-line arguments and run the client
 parseCommandLineArgs(process.argv.slice(2), 3333, 'Usage: npx tsx client.ts <https://server-url> [callback-port]')
-  .then(({ serverUrl, callbackPort, headers }) => {
-    return runClient(serverUrl, callbackPort, headers)
+  .then(({ serverUrl, callbackPort, headers, transportType }) => {
+    return runClient(serverUrl, callbackPort, headers, transportType)
   })
   .catch((error) => {
     console.error('Fatal error:', error)
